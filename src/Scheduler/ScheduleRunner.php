@@ -7,7 +7,9 @@ namespace Atom\Scheduler;
 use Atom\Console\BufferedConsoleOutput;
 use Atom\Console\ConsoleApplication;
 use Atom\Queue\JobDispatcherInterface;
-use Atom\Queue\QueueJobDispatcher;
+use Atom\Queue\OverlapAwareJobDispatcherInterface;
+use Atom\Support\ClockInterface;
+use Atom\Support\FileOverlapLocks;
 use RuntimeException;
 use Throwable;
 
@@ -19,7 +21,7 @@ final readonly class ScheduleRunner
         private ConsoleApplication $console,
         private JobDispatcherInterface $jobs,
         private ?ScheduleMinuteClaims $minuteClaims = null,
-        private ?ScheduleTaskLocks $taskLocks = null
+        private ?FileOverlapLocks $taskLocks = null
     ) {
     }
 
@@ -36,7 +38,8 @@ final readonly class ScheduleRunner
             $lock = null;
             try {
                 $lockKey = $task->overlapLockKey();
-                if ($lockKey !== null && !($task instanceof ScheduledJob && $this->jobs instanceof QueueJobDispatcher)) {
+                $lockInWorker = $task instanceof ScheduledJob && $this->jobs instanceof OverlapAwareJobDispatcherInterface;
+                if ($lockKey !== null && !$lockInWorker) {
                     if ($this->taskLocks === null) {
                         throw new RuntimeException("No scheduler lock store is configured for '{$lockKey}'.");
                     }
@@ -71,7 +74,7 @@ final readonly class ScheduleRunner
     private function execute(ScheduledTask $task): ScheduledTaskResult
     {
         if ($task instanceof ScheduledJob) {
-            if ($this->jobs instanceof QueueJobDispatcher) {
+            if ($this->jobs instanceof OverlapAwareJobDispatcherInterface) {
                 $this->jobs->dispatch($task->job, $task->delay, $task->queue, $task->overlapLockKey());
             } else {
                 $this->jobs->dispatch($task->job, $task->delay, $task->queue);

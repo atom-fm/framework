@@ -23,11 +23,14 @@ use Atom\Console\ConsoleApplication;
 use Atom\Console\ConsoleServices;
 use Atom\Http\Request;
 use Atom\Http\CookieJar;
+use Atom\Http\ErrorPageHandlerInterface;
 use Atom\Http\Response;
 use Atom\Http\RequestHandlerInterface;
 use Atom\Http\MiddlewareInterface;
 use Atom\Http\MiddlewareRegistry;
 use Atom\Identity\IdentityServices;
+use Atom\Logging\Log;
+use Atom\Logging\LoggerInterface;
 use Atom\Mail\MailServices;
 use Atom\Identity\AuthenticatorInterface;
 use Atom\Dispatcher\MiddlewarePipeline;
@@ -36,10 +39,10 @@ use Atom\Module\ModuleContext;
 use Atom\Module\ModuleInterface;
 use Atom\Module\ModuleRegistry;
 use Atom\Module\ModuleScope;
-use Atom\Modules\ErrorPages\ErrorPageHandlerInterface;
+use Atom\Modules\ComponentStyles\ComponentStylesServices;
 use Atom\Modules\ErrorPages\ErrorPages;
-use Atom\Modules\Icons\IconProviderInterface;
-use Atom\Modules\Icons\IconRegistry;
+use Atom\View\Icons\IconProviderInterface;
+use Atom\View\Icons\IconRegistry;
 use Atom\Modules\Icons\IconServices;
 use Atom\Page\PageRegistry;
 use Atom\Publish\PublishServices;
@@ -47,6 +50,7 @@ use Atom\Queue\JobRegistry;
 use Atom\Queue\QueueServices;
 use Atom\Page\PageRouteRegistrar;
 use Atom\Page\PageServices;
+use Atom\Profiler\Profile;
 use Atom\Profiler\Profiler;
 use Atom\Router\MatchedRoute;
 use Atom\Router\Route;
@@ -57,8 +61,13 @@ use Atom\Session\SessionServices;
 use Atom\Security\SecurityServices;
 use Atom\Scheduler\Schedule;
 use Atom\Scheduler\ScheduleServices;
+use Atom\Support\ClockServices;
 use Atom\Support\Paths;
+use Atom\View\Ast\TemplateNode;
 use Atom\View\Component\ComponentRegistry;
+use Atom\View\TemplateCache;
+use Atom\View\Templates;
+use Closure;
 use RuntimeException;
 use Throwable;
 
@@ -77,6 +86,7 @@ abstract class Application
     private ?Bindings $bindings = null;
     private ?Injector $injector = null;
     private ?InjectionContext $currentContext = null;
+    private ?MatchedRoute $lastMatchedRoute = null;
     private bool $initialized = false;
     protected string $baseUrl = "";
 
@@ -86,6 +96,24 @@ abstract class Application
             throw new RuntimeException("Application was already initialized");
         }
         static::$app = $this;
+        Log::resolveUsing(static function (): ?LoggerInterface {
+            $injector = self::$app?->getInjector();
+
+            return $injector?->has(LoggerInterface::class) ? $injector->get(LoggerInterface::class) : null;
+        });
+        Profile::resolveUsing(static fn(): ?Profiler => self::$app?->activeProfiler());
+        Templates::resolveUsing(static function (): ?TemplateCache {
+            $injector = self::$app?->injector;
+
+            return $injector?->has(TemplateCache::class) ? $injector->get(TemplateCache::class) : null;
+        });
+        Templates::instrumentComponentParsingUsing(
+            static fn(string $path, string $component, Closure $parse): TemplateNode => Profile::measure(
+                "view.parse",
+                $parse,
+                ["component" => $component, "template" => $path]
+            )
+        );
     }
 
     final public function getProviders(): ServiceProviderRegistry
@@ -130,8 +158,12 @@ abstract class Application
 
     final public function getProfiler(): Profiler
     {
-        return $this->requestProfiler ?? $this->bootstrapProfiler
-            ?? throw new RuntimeException("Application has not been initialized.");
+        return $this->activeProfiler() ?? throw new RuntimeException("Application has not been initialized.");
+    }
+
+    private function activeProfiler(): ?Profiler
+    {
+        return $this->requestProfiler ?? $this->bootstrapProfiler;
     }
 
     final public function getRouter(): Router
@@ -141,7 +173,11 @@ abstract class Application
 
     final public function getCurrentRoute(): ?MatchedRoute
     {
-        $route = $this->currentContext?->get(MatchedRoute::class);
+        if ($this->currentContext === null) {
+            return $this->lastMatchedRoute;
+        }
+
+        $route = $this->currentContext->get(MatchedRoute::class);
         return $route instanceof MatchedRoute ? $route : null;
     }
 
@@ -219,7 +255,9 @@ abstract class Application
     {
         $providers
             ->add(CacheServices::class)
+            ->add(ClockServices::class)
             ->add(ConsoleServices::class)
+            ->add(ComponentStylesServices::class)
             ->add(DispatcherServices::class)
             ->add(IdentityServices::class)
             ->add(IconServices::class)
@@ -413,15 +451,21 @@ abstract class Application
 
     final public function handle(?Request $request = null): Response
     {
+        return $this->processRequest($request, emit: false);
+    }
+
+    private function processRequest(?Request $request, bool $emit): Response
+    {
         $initializing = !$this->initialized;
         try {
             $this->initialize();
         } catch (Throwable $exception) {
-            return $this->renderException($exception, $request ?? Request::fromGlobals());
+            return $this->finishResponse($this->renderException($exception, $request ?? Request::fromGlobals()), $emit);
         }
 
         $profiler = new Profiler();
         $previousProfiler = $this->requestProfiler;
+        $previousContext = $this->currentContext;
         $this->requestProfiler = $profiler;
         $this->currentContext = new InjectionContext();
         $this->currentContext->set(Profiler::class, $profiler);
@@ -432,12 +476,16 @@ abstract class Application
         try {
             $response = $this->dispatchRequest($request, $profiler);
             $response = $this->applyCookies($response);
-            $this->addProfilerHeaders($response, $profiler);
             if ($initializing && $this->bootstrapProfiler !== null) {
                 $response->header("X-Atom-Time-App-Initialize", number_format($this->bootstrapProfiler->total("app.initialize"), 2, ".", "") . "ms");
             }
-            return $response;
+            $this->addProfilerHeaders($response, $profiler);
+            return $this->finishResponse($response, $emit);
         } finally {
+            if ($previousContext === null) {
+                $this->lastMatchedRoute = $this->getCurrentRoute();
+            }
+            $this->currentContext = $previousContext;
             $this->requestProfiler = $previousProfiler;
         }
     }
@@ -492,9 +540,15 @@ abstract class Application
 
     final public function run(?Request $request = null): Response
     {
-        $response = $this->handle($request);
-        $emitter = $this->injector === null ? new ResponseEmitter() : $this->getResponseEmitter();
-        $emitter->emit($response);
+        return $this->processRequest($request, emit: true);
+    }
+
+    private function finishResponse(Response $response, bool $emit): Response
+    {
+        if ($emit) {
+            $emitter = $this->injector === null ? new ResponseEmitter() : $this->getResponseEmitter();
+            $emitter->emit($response);
+        }
 
         return $response;
     }
@@ -504,7 +558,12 @@ abstract class Application
         $response->header("X-Atom-Time", number_format($profiler->totalMs(), 2, ".", "") . "ms");
 
         foreach ($profiler->summary() as $summary) {
-            $header = "X-Atom-Time-" . str_replace(".", "-", ucwords($summary->name, "."));
+            $baseHeader = "X-Atom-Time-" . str_replace(".", "-", ucwords($summary->name, "."));
+            $header = $baseHeader;
+            for ($suffix = 2; $response->headers()->has($header); $suffix++) {
+                $header = "{$baseHeader}-{$suffix}";
+            }
+
             $value = number_format($summary->totalMs, 2, ".", "") . "ms";
             if ($summary->count > 1) {
                 $value .= "; count=" . $summary->count;

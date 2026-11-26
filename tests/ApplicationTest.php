@@ -15,6 +15,7 @@ use Atom\Console\ConsoleApplication;
 use Atom\Console\Attributes\ConsoleCommand;
 use Atom\Console\ConsoleOutput;
 use Atom\Di\Bindings;
+use Atom\Di\InjectionContext;
 use Atom\Di\Injector;
 use Atom\Di\ServiceProviderInterface;
 use Atom\Di\ServiceProviderRegistry;
@@ -24,24 +25,29 @@ use Atom\Http\Response;
 use Atom\Http\Cookie;
 use Atom\Http\CorsMiddleware;
 use Atom\Http\CorsOptions;
+use Atom\Http\MiddlewareInterface;
 use Atom\Http\MiddlewareRegistry;
+use Atom\Http\RequestHandlerInterface;
 use Atom\Http\RequestIdMiddleware;
 use Atom\Module\ModuleContext;
 use Atom\Module\ModuleInterface;
 use Atom\Module\ModuleRegistry;
 use Atom\Page\PageRegistry;
-use Atom\Modules\Icons\IconProviderInterface;
-use Atom\Modules\Icons\IconRegistry;
-use Atom\Modules\Icons\IconResolverInterface;
+use Atom\View\Icons\IconProviderInterface;
+use Atom\View\Icons\IconRegistry;
+use Atom\View\Icons\IconResolverInterface;
 use Atom\Modules\ErrorPages\ErrorPagesOptions;
 use Atom\Profiler\Profile;
 use Atom\Profiler\Profiler;
 use Atom\Router\Route;
 use Atom\Router\RouteEntry;
 use Atom\Router\RouteMatcher;
+use Atom\Router\Router;
 use Atom\Support\Paths;
 use Atom\View\Component\ComponentInterface;
 use Atom\View\Component\ComponentRegistry;
+use Atom\View\TemplateCache;
+use Atom\View\Templates;
 use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
 
@@ -73,7 +79,7 @@ final class ApplicationTest extends TestCase
     }
 
     #[TestWith([false, "module"], "module overrides an unresolved binding")]
-    #[TestWith([true, "ready"], "resolved singleton keeps its identity")]
+    #[TestWith([true, "module"], "module replaces a resolved singleton")]
     public function testModuleBindingPrecedence(bool $resolveEarly, string $expected): void
     {
         $app = new class($resolveEarly) extends Application {
@@ -111,7 +117,7 @@ final class ApplicationTest extends TestCase
         $response = $app->handle(new Request("GET", "/binding"));
         $this->assertSame($expected, $response->getContent());
         if ($resolveEarly) {
-            $this->assertSame($app->original, $app->getInjector()->get(TestApplicationMarker::class));
+            $this->assertNotSame($app->original, $app->getInjector()->get(TestApplicationMarker::class));
         }
     }
 
@@ -124,11 +130,11 @@ final class ApplicationTest extends TestCase
             protected function modules(ModuleRegistry $modules): void
             {
                 $this->earlyConsole = $this->getConsole();
-                $this->discoveredEarly = $this->earlyConsole->commands()->has("discovered:hello");
+                $this->discoveredEarly = $this->earlyConsole->commands()->has("module:hello");
                 $modules->add(new class implements ModuleInterface {
                     public function register(ModuleContext $context): void
                     {
-                        $context->commands(__DIR__ . "/Console/Fixtures/Commands", "Atom\\Tests\\Console\\Fixtures\\Commands");
+                        $context->commands(__DIR__ . "/Module/Fixtures/Commands", "Atom\\Tests\\Module\\Fixtures\\Commands");
                     }
                 });
             }
@@ -139,8 +145,8 @@ final class ApplicationTest extends TestCase
         $this->assertFalse($app->discoveredEarly);
         $this->assertSame($app->earlyConsole, $app->getConsole());
         $output = new BufferedConsoleOutput();
-        $this->assertSame(0, $app->earlyConsole->run(["atom", "discovered:hello", "Atom"], $output), $output->errors());
-        $this->assertSame("Hello, Atom!" . PHP_EOL, $output->output());
+        $this->assertSame(0, $app->earlyConsole->run(["atom", "module:hello", "Atom"], $output), $output->errors());
+        $this->assertSame("Hello Atom from module" . PHP_EOL, $output->output());
         $this->assertTrue($app->earlyConsole->commands()->has("atom:about"));
     }
 
@@ -209,6 +215,53 @@ final class ApplicationTest extends TestCase
         $this->assertSame(["name" => "Atom"], $app->getCurrentRoute()?->getRouteParams());
     }
 
+    public function testFailedRequestReleasesItsScopeBeforeSuccessfulRun(): void
+    {
+        $app = new TestApplication();
+        $app->initialize();
+        $emittedRequest = null;
+        $app->getBindings()->factory(
+            ResponseEmitterInterface::class,
+            static function (Injector $injector, InjectionContext $context) use ($app, &$emittedRequest): ResponseEmitterInterface {
+                $emittedRequest = $injector->get(Request::class, $context);
+                return $app->emitter;
+            }
+        )->scoped();
+
+        $failedRequest = new Request("GET", "/fail/first");
+        $failed = $app->handle($failedRequest);
+        self::assertSame(500, $failed->getStatus());
+        self::assertSame(["name" => "first"], $app->getCurrentRoute()?->getRouteParams());
+        self::assertNotEmpty($failed->headers()->all("Set-Cookie"));
+        self::assertNotNull($failed->headers()->get("X-Atom-Time-Failed-Work"));
+        self::assertNull($app->emitter->response);
+        self::assertNotSame($failedRequest, $app->getRequest());
+
+        $successfulRequest = new Request("GET", "/hello/second");
+        $successful = $app->run($successfulRequest);
+        self::assertSame(200, $successful->getStatus());
+        self::assertSame("Hello second", $successful->getContent());
+        self::assertSame(["name" => "second"], $app->getCurrentRoute()?->getRouteParams());
+        self::assertSame([], $successful->headers()->all("Set-Cookie"));
+        self::assertNull($successful->headers()->get("X-Atom-Time-Failed-Work"));
+        self::assertNotNull($successful->headers()->get("X-Atom-Time-Request-Dispatch"));
+        self::assertSame($successful, $app->emitter->response);
+        self::assertSame($successfulRequest, $emittedRequest);
+        self::assertNotSame($successfulRequest, $app->getRequest());
+    }
+
+    public function testNestedRequestRestoresTheOuterRequestScope(): void
+    {
+        $app = new TestApplication();
+        $response = $app->handle(new Request("GET", "/nested/outer"));
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame("500 /nested/outer outer", $response->getContent());
+        self::assertSame(["name" => "outer"], $app->getCurrentRoute()?->getRouteParams());
+        self::assertSame([], $response->headers()->all("Set-Cookie"));
+        self::assertNull($response->headers()->get("X-Atom-Time-Failed-Work"));
+    }
+
     public function testGlobalCorsMiddlewareHandlesPreflightBeforeRouteMatching(): void
     {
         $app = new TestCorsApplication();
@@ -236,6 +289,39 @@ final class ApplicationTest extends TestCase
         );
     }
 
+    public function testMiddlewareWrapsRouteActionInRegistrationOrder(): void
+    {
+        $middleware = static fn(string $name): MiddlewareInterface => new class ($name) implements MiddlewareInterface {
+            public function __construct(private readonly string $name)
+            {
+            }
+
+            public function process(Request $request, RequestHandlerInterface $handler): Response
+            {
+                $order = $request->headers()->get("X-Middleware-Order") ?? "";
+                $response = $handler->handle($request->withHeader("X-Middleware-Order", $order . $this->name . ":"));
+
+                return $response->content($response->getContent() . ":" . $this->name);
+            }
+        };
+
+        $app = new TestApplication();
+        $app->initialize();
+        $app->getMiddlewares()->add($middleware("global"));
+        $router = $app->getRouter()->middleware($middleware("router"));
+        $group = (new Router("/group"))->middleware($middleware("group"));
+        $router->add($group);
+        $group->add(RouteEntry::get(
+            "/action",
+            static fn(Request $request): string => $request->headers()->get("X-Middleware-Order") . "action"
+        )->middleware($middleware("route")));
+
+        $response = $app->handle(new Request("GET", "/group/action"));
+
+        $this->assertSame(200, $response->getStatus());
+        $this->assertSame("global:router:group:route:action:route:group:router:global", $response->getContent());
+    }
+
     public function testQueuedCookieIsAppliedWhenActionReturnsDifferentResponse(): void
     {
         $app = new TestApplication();
@@ -249,6 +335,22 @@ final class ApplicationTest extends TestCase
         );
     }
 
+    public function testTemplatesShareTheApplicationCacheWhenAvailable(): void
+    {
+        $fallback = Templates::cache();
+        $app = new TestApplication();
+        $this->assertSame($fallback, Templates::cache());
+
+        $app->initialize();
+        $cache = $app->getInjector()->get(TemplateCache::class);
+
+        $this->assertNotSame($fallback, $cache);
+        $this->assertSame($cache, Templates::cache());
+
+        Application::$app = null;
+        $this->assertSame($fallback, Templates::cache());
+    }
+
     public function testRunAddsProfilerHeadersAndBindsProfiler(): void
     {
         $app = new TestApplication();
@@ -256,6 +358,8 @@ final class ApplicationTest extends TestCase
         $response = $app->handle(new Request("GET", "/hello/Atom"));
 
         $this->assertSame($app->getProfiler(), $app->getInjector()->get(Profiler::class));
+        $this->assertSame($app->getProfiler(), Profile::profiler());
+        $this->assertSame(1, $app->getProfiler()->count("test.bootstrap"));
         $this->assertNotNull($response->headers()->get("X-Atom-Time"));
         $this->assertNotNull($response->headers()->get("X-Atom-Time-App-Initialize"));
         $this->assertNotNull($response->headers()->get("X-Atom-Time-Request-Dispatch"));
@@ -294,6 +398,18 @@ final class ApplicationTest extends TestCase
         $response = $app->handle(new Request("GET", "/profile/repeated"));
 
         $this->assertStringContainsString("count=2", (string) $response->headers()->get("X-Atom-Time-Custom-Work"));
+    }
+
+    public function testProfilerHeadersPreserveCollidingSpanSummaries(): void
+    {
+        $response = (new TestApplication())->handle(new Request("GET", "/profile/collisions"));
+        $headers = $response->headers();
+
+        self::assertStringContainsString("count=2", (string) $headers->get("X-Atom-Time-Cache-Read"));
+        self::assertStringContainsString("count=3", (string) $headers->get("X-Atom-Time-Cache-Read-2"));
+        self::assertMatchesRegularExpression('/^\d+\.\d{2}ms$/', (string) $headers->get("X-Atom-Time-Cache-Read-3"));
+        self::assertMatchesRegularExpression('/^\d+\.\d{2}ms$/', (string) $headers->get("X-Atom-Time-App-Initialize"));
+        self::assertStringContainsString("count=2", (string) $headers->get("X-Atom-Time-App-Initialize-2"));
     }
 
     public function testApplicationProvidesConsoleWithFrameworkCommands(): void
@@ -420,11 +536,29 @@ final class TestApplication extends Application
     protected function bootstrap(Injector $injector): void
     {
         $this->bootstrapped = true;
+        Profile::measure("test.bootstrap", static fn(): null => null);
 
         Route::get("/hello/{name}", fn(string $name) => "Hello " . $name);
+        Route::get("/fail/{name}", static function (Response $response): never {
+            $response->cookie(Cookie::create("failed", "request"));
+            Profile::measure("failed.work", static fn(): null => null);
+            throw new \RuntimeException("Request failed.");
+        });
+        Route::get("/nested/{name}", function (): string {
+            $inner = $this->handle(new Request("GET", "/fail/inner"));
+            $name = $this->getCurrentRoute()?->getRouteParams()["name"] ?? "";
+            return $inner->getStatus() . " " . $this->getRequest()->getPath() . " " . $name;
+        });
         Route::get("/profile/repeated", function (Profiler $profiler): string {
             $profiler->measure("custom.work", static fn(): null => null);
             Profile::measure("custom.work", static fn(): null => null);
+
+            return "ok";
+        });
+        Route::get("/profile/collisions", static function (Profiler $profiler): string {
+            foreach (["cache.read", "cache.read", "cache.read-2", "cache.read-2", "cache.read-2", "cache-read", "app.initialize", "app.initialize"] as $name) {
+                $profiler->begin($name)->end();
+            }
 
             return "ok";
         });

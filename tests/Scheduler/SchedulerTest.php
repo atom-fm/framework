@@ -10,14 +10,17 @@ use Atom\Console\CommandInterface;
 use Atom\Console\ConsoleApplication;
 use Atom\Console\ConsoleInput;
 use Atom\Console\ConsoleOutput;
-use Atom\Di\Injector;
+use Atom\Di\ServiceProviderRegistry;
 use Atom\Queue\JobDispatcherInterface;
 use Atom\Queue\JobInterface;
 use Atom\Queue\JobRegistry;
-use Atom\Scheduler\ClockInterface;
+use Atom\Queue\OverlapAwareJobDispatcherInterface;
 use Atom\Scheduler\Commands\ScheduleCommands;
 use Atom\Scheduler\Schedule;
 use Atom\Scheduler\ScheduleRunner;
+use Atom\Scheduler\ScheduleServices;
+use Atom\Support\ClockInterface;
+use Atom\Support\SystemClock;
 use DateTimeImmutable;
 use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\TestWith;
@@ -28,6 +31,15 @@ final class SchedulerTest extends TestCase
     protected function tearDown(): void
     {
         Application::$app = null;
+    }
+
+    public function testStandaloneScheduleProviderUsesTheSharedClockByDefault(): void
+    {
+        $injector = ServiceProviderRegistry::create()->add(ScheduleServices::class)->injector();
+        $clock = $injector->get(ClockInterface::class);
+
+        self::assertInstanceOf(SystemClock::class, $clock);
+        self::assertSame($clock, $injector->get(ClockInterface::class));
     }
 
     public function testFluentFrequenciesBuildCronExpressions(): void
@@ -54,7 +66,7 @@ final class SchedulerTest extends TestCase
         $schedule->command("test:record", ["later"])->daily()->at("09:00")->timezone("Europe/Sarajevo");
 
         $command = new RecordingCommand();
-        $console = (new ConsoleApplication(Injector::create()))->command("test:record", $command);
+        $console = (new ConsoleApplication())->command("test:record", $command);
         $jobs = new RecordingJobDispatcher();
         $clock = new FrozenClock(new DateTimeImmutable("2026-07-20 06:00:00 UTC"));
         $result = (new ScheduleRunner($schedule, $clock, $console, $jobs))->run();
@@ -72,7 +84,7 @@ final class SchedulerTest extends TestCase
         $schedule->command("test:fail");
         $schedule->command("test:record");
         $recording = new RecordingCommand();
-        $console = (new ConsoleApplication(Injector::create()))
+        $console = (new ConsoleApplication())
             ->command("test:fail", new FailingCommand())
             ->command("test:record", $recording);
         $runner = new ScheduleRunner(
@@ -89,12 +101,36 @@ final class SchedulerTest extends TestCase
         $this->assertCount(1, $recording->arguments);
     }
 
+    public function testRunnerPassesTheOverlapKeyToACapableDispatcher(): void
+    {
+        $job = new ScheduledFixtureJob("mail");
+        $schedule = new Schedule();
+        $schedule->job($job, delay: 30, queue: "mail")->withoutOverlapping("mail.poll");
+
+        $dispatcher = $this->createMock(OverlapAwareJobDispatcherInterface::class);
+        $dispatcher->expects($this->once())
+            ->method("dispatch")
+            ->with($job, 30, "mail", "mail.poll")
+            ->willReturn("scheduled-job");
+
+        $runner = new ScheduleRunner(
+            $schedule,
+            new FrozenClock(new DateTimeImmutable("2026-07-20 12:00:00 UTC")),
+            new ConsoleApplication(),
+            $dispatcher
+        );
+        $result = $runner->run();
+
+        $this->assertSame(1, $result->count());
+        $this->assertSame(0, $result->failed());
+    }
+
     public function testScheduleCommandsRenderRunAndListDiagnostics(): void
     {
         $schedule = new Schedule();
         $schedule->command("test:record")->daily()->at("08:00")->name("Daily record");
         $clock = new FrozenClock(new DateTimeImmutable("2026-07-20 08:00:00 UTC"));
-        $console = (new ConsoleApplication(Injector::create()))
+        $console = (new ConsoleApplication())
             ->command("test:record", new RecordingCommand());
         $runner = new ScheduleRunner($schedule, $clock, $console, new RecordingJobDispatcher());
 
@@ -158,6 +194,7 @@ final class SchedulerTest extends TestCase
                 usleep(10000);
             }
             $this->assertFileExists($root . "/" . $record, file_get_contents($root . "/first.log"));
+            $this->assertFileExists($root . "/storage/scheduler/" . hash("sha256", $mode) . ".lock");
             $second = $this->startSchedule($root, "second", "2026-11-23T09:01:00Z", $mode);
             $this->assertSame(0, proc_close($second), file_get_contents($root . "/second.log"));
             $this->assertStringContainsString("No scheduled tasks to run.", file_get_contents($root . "/second.log"));

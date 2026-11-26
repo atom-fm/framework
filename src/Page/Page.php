@@ -4,17 +4,20 @@ declare(strict_types=1);
 
 namespace Atom\Page;
 
+use Atom\Http\HttpException;
 use Atom\Http\MiddlewareInterface;
 use Atom\Http\Response;
-use Atom\Modules\ErrorPages\HttpException;
 use Atom\Router\Route;
 use Atom\Router\MatchedRoute;
 use Atom\Router\RouteEntry;
 use Atom\Validation\ValidationResult;
 use Atom\Validation\Validator;
+use Atom\View\Component\ComponentContextValueInterface;
+use ReflectionNamedType;
+use ReflectionType;
 use RuntimeException;
 
-abstract class Page
+abstract class Page implements ComponentContextValueInterface
 {
     public ?string $layout = null;
     private ?MatchedRoute $uriRoute = null;
@@ -24,6 +27,14 @@ abstract class Page
     private string $flashMessage = "";
     private string $flashTitle = "";
     private string $flashVariant = "success";
+
+    /** @internal */
+    final public function supportsComponentProperty(string $name, ?ReflectionType $type): bool
+    {
+        return $name === "page"
+            && $type instanceof ReflectionNamedType
+            && is_a($type->getName(), self::class, true);
+    }
 
     /**
      * @param array<class-string<MiddlewareInterface>|MiddlewareInterface> $middlewares
@@ -92,7 +103,7 @@ abstract class Page
 
     public function validate(): bool
     {
-        $this->validation = Validator::for(static::class)->validate($this);
+        $this->validation = Validator::for()->validate($this);
 
         return $this->validation->passed();
     }
@@ -100,7 +111,7 @@ abstract class Page
     /** @param array<string, mixed>|object $model */
     protected function validateModel(array|object $model, string|null $className = null): bool
     {
-        $this->validation = Validator::for($className ?? (is_object($model) ? $model::class : null))->validate($model);
+        $this->validation = Validator::for($className)->validate($model);
 
         return $this->validation->passed();
     }

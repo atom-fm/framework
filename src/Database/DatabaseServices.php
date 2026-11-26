@@ -42,10 +42,11 @@ final readonly class DatabaseServices implements ServiceProviderInterface, Conso
     public static function fromConfig(Config $config, Paths $paths): self
     {
         $database = $config->options(DatabaseConfig::class);
+        $driver = (new DatabaseDriverFactory($paths->resolve("@root")))->create($database);
         self::prepareStorage($database, $paths);
 
         return new self(
-            (new DatabaseDriverFactory($paths->resolve("@root")))->create($database),
+            $driver,
             new MigrationOptions($paths->resolve("@migrations")),
             new SeederOptions($paths->resolve("@seeders"))
         );
